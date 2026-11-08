@@ -211,7 +211,8 @@
     if (t && t.closest && t.closest("#drawer")) return;      // typing to the tutor
     var k = e.key;
     var map = { a: "A", b: "B", c: "C", d: "D", "1": "A", "2": "B", "3": "C", "4": "D" };
-    if (map[k.toLowerCase()]) { e.preventDefault(); activeKeys.pick(map[k.toLowerCase()]); }
+    if (map[k.toLowerCase()] && e.shiftKey && activeKeys.strike) { e.preventDefault(); activeKeys.strike(map[k.toLowerCase()]); }
+    else if (map[k.toLowerCase()]) { e.preventDefault(); activeKeys.pick(map[k.toLowerCase()]); }
     else if (k === "Enter") {
       if (tag === "A" || (tag === "BUTTON" && !t.classList.contains("pick"))) return;   // let focused buttons work normally
       e.preventDefault(); activeKeys.enter();
@@ -219,6 +220,8 @@
     else if (k === "ArrowRight") { e.preventDefault(); activeKeys.next(); }
     else if (k === "ArrowLeft") { e.preventDefault(); activeKeys.prev(); }
   });
+
+  function struckOnce() { try { return !!localStorage.getItem("sat.struckOnce"); } catch (e) { return true; } }
 
   // ------------------------------------------------------------------ question runner
   /* opts: ids, context, sessionId, startIndex, answered (qid -> {selected, correct, tries, solved}),
@@ -287,10 +290,12 @@
         '<span class="chip dom">' + esc(q.unitTitle) + "</span>" +
         '<span class="chip">' + ["", "Easy", "Medium", "Hard"][q.difficulty] + "</span></div>" +
         '<div class="qtext">' + md(q.question) + "</div>" +
-        '<div class="choices"></div><div class="tryslot" aria-live="polite"></div>' +
+        '<div class="choices"></div>' + (struckOnce() || (st && st.solved) ? "" :
+          '<p class="striketip">Think a choice is wrong? Click its letter on the right (or right-click the choice) to cross it out.</p>') +
+        '<div class="tryslot" aria-live="polite"></div>' +
         '<div class="qactions"><button class="btn primary" data-act="submit" disabled>Check answer</button>' +
         '<span class="spacer"></span><button class="btn small" data-act="ask">' + ico("chat") + "Ask tutor</button></div>" +
-        '<div class="keyhint"><kbd>A</kbd>–<kbd>D</kbd> to pick, <kbd>Enter</kbd> to check, <kbd>←</kbd> <kbd>→</kbd> to move</div>' +
+        '<div class="keyhint"><kbd>A</kbd>–<kbd>D</kbd> to pick, <kbd>Shift</kbd>+letter to cross out, <kbd>Enter</kbd> to check, <kbd>←</kbd> <kbd>→</kbd> to move</div>' +
         "</div></div>";
       var choicesEl = root.querySelector(".choices"), trySlot = root.querySelector(".tryslot");
       var fbSlot = el("<div></div>");
@@ -298,19 +303,30 @@
       q.choices.forEach(function (c, i) {
         var L = LETTERS[i];
         var ch = el('<div class="choice" data-l="' + L + '"><button class="pick" type="button"><span class="letter">' + L +
-          '</span><span>' + inline(c) + '</span></button><button class="strike" type="button" title="Cross out" aria-label="Cross out ' + L + '">' + ico("x") + "</button></div>");
+          '</span><span>' + inline(c) + '</span></button><button class="strike" type="button" title="Cross out ' + L + ' (rule it out)" aria-label="Cross out ' + L + '">' +
+          '<span class="sl">' + L + '</span><span class="undo">Undo</span></button></div>');
         ch.querySelector(".pick").onclick = function () {
           if (solved() || tried(L) || busy) return;
           selected = L; struck[L] = false; refresh();
         };
-        ch.querySelector(".strike").onclick = function () {
+        ch.querySelector(".strike").onclick = function () { toggleStrike(L); };
+        // Right-click (two-finger click on a Mac trackpad) also crosses a choice out.
+        ch.addEventListener("contextmenu", function (e) {
           if (solved() || tried(L)) return;
-          struck[L] = !struck[L];
-          if (struck[L] && selected === L) selected = null;
-          refresh();
-        };
+          e.preventDefault();
+          toggleStrike(L);
+        });
         choicesEl.appendChild(ch);
       });
+      function toggleStrike(L) {
+        if (solved() || tried(L)) return;
+        struck[L] = !struck[L];
+        if (struck[L] && selected === L) selected = null;
+        try { localStorage.setItem("sat.struckOnce", "1"); } catch (e) { }
+        var tip = root.querySelector(".striketip");
+        if (tip) tip.remove();
+        refresh();
+      }
       each(root.querySelectorAll(".qdots button"), function (b) { b.onclick = function () { go(+b.getAttribute("data-i")); }; });
       root.querySelector('[data-nav="prev"]').onclick = function () { if (idx > 0) go(idx - 1); };
       root.querySelector('[data-nav="next"]').onclick = function () { go(idx + 1); };
@@ -391,6 +407,7 @@
           var sb = root.querySelector('[data-act="submit"]');
           if (sb && !sb.disabled) sb.click();
         },
+        strike: function (L) { toggleStrike(L); },
         prev: function () { if (idx > 0) go(idx - 1); },
         next: function () { go(idx + 1); }
       };
@@ -735,7 +752,7 @@
         (t.reason ? '<div class="rs">' + esc(t.reason) + "</div>" : "") +
         '<a class="linkbtn small" href="#/notes?u=' + t.unit + '">Preview the notes</a></div>';
     }).join("") +
-      '<div class="wk-sum">Video lesson' + (d.topics.length > 1 ? "s" : "") + ", worked example" + (d.minutes > 30 ? "s" : "") + ", " +
+      '<div class="wk-sum">Video lesson' + (d.topics.length > 1 ? "s" : "") + ", worked example" + (d.minutes > 30 ? "s" : "") + ", notes to copy, " +
       practice + " questions" + (d.reviews ? " + " + d.reviews + " mistake review" + (d.reviews > 1 ? "s" : "") : "") + "</div>" +
       (canStart ? '<button class="btn primary" data-act="ahead">' + ico("play") + "Start it now</button>" :
         d.aheadHint ? '<p class="muted small" style="margin:10px 0 0">' + esc(d.aheadHint) + "</p>" : "") +
