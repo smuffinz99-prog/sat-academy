@@ -1,0 +1,5 @@
+.venv/
+tools/.cache/
+tools/.work/
+__pycache__/
+.claude/
