@@ -3,3 +3,4 @@ tools/.cache/
 tools/.work/
 __pycache__/
 .claude/
+tools/.tts/

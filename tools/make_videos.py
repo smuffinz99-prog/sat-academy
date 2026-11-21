@@ -8,8 +8,10 @@ How it works
   1. Script. The lesson content in py.zip (short.py, notes.py and the worked
      example) becomes scenes made of lines. Every line is text on screen, and
      the narration is made from those same words, so the two always match.
-  2. Speech. Each line is spoken by a neural voice (edge-tts), which also says
-     when every word starts. Results are cached in tools/.cache.
+  2. Speech. Each line is spoken by Kokoro, an open-source voice model that
+     runs on this PC (tools/kokoro_tts.py, in the tools/.tts environment). It
+     says when every word starts, and a real pause is cut in after every comma
+     and full stop. Results are cached in tools/.cache.
   3. Timeline. Lines are joined with deliberate pauses. Slides build up line
      by line, and each word lights up as it is spoken.
   4. Frames. Microsoft Edge (through Playwright) renders tools/video_frame.html
@@ -34,7 +36,6 @@ import wave
 import zipfile
 from pathlib import Path
 
-import edge_tts
 import imageio_ffmpeg
 import numpy as np
 from PIL import Image
@@ -47,11 +48,15 @@ WORK = TOOLS / ".work"
 VIDEOS = ROOT / "videos"
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 
-VOICE = "en-US-EmmaMultilingualNeural"
-RATE = "-8%"            # a little slower than normal speech, so it's easy to read along
-SR = 24000              # edge-tts audio sample rate
+# The voice (picked from samples): a bright American Kokoro voice blended with a Japanese anime-style
+# one, then pitched up a little and brightened.
+VOICE = "af_bella=0.6+jf_alpha=0.4"
+SPEED = 0.92            # a little slower than normal speech, so it's easy to read along
+CUTE = (1.15, 1.06)     # pitch x1.15, tone brightened (formants x1.06)
+TTS_PY = TOOLS / ".tts" / "Scripts" / "python.exe"
+LETTER_A = "[A](/ˈA/)"  # the letter A, never the word "a"
+SR = 24000              # Kokoro audio sample rate
 FPS = 30
-TTS_PARALLEL = 6
 RENDER_PARALLEL = 3
 
 # Pauses, in seconds.
@@ -76,8 +81,7 @@ NUM_WORDS = {1: "One", 2: "Two", 3: "Three", 4: "Four", 5: "Five", 6: "Six"}
 # Markup:  *italic*  **bold**  [B] = answer-letter badge  {shown|spoken}
 #          #h0 / #c0 = highlight / cross out phrase 0 of the step at this word
 #          #xB / #pB = strike out / pick choice B at this word      #t = highlight the table cells
-# The letter A is only ever said at the end of a sentence ("Choice A.") or in a list ("A, C,
-# and D"), because the voice reads a lone "A" mid-sentence as the word "a".
+# The answer letter A is always given its letter sound (LETTER_A), so it is never read as "a".
 DEMO = {
     "TRN": [
         "#h0 Most desert plants store water. The ocotillo #h1 *drops* its leaves. That's the opposite, so the link is contrast.",
@@ -184,10 +188,11 @@ DEMO = {
 
 # Display text the automatic rules can't voice well: replaced before tokenising. {shown|spoken}
 SAY_FIX = {
-    "A and B": "{A|Ay} and B",
+    "A and B": "{A|" + LETTER_A + "} and B",
     "(, ,  — —  ( ))": "{(, ,  — —  ( ))|— two commas, two dashes, or two brackets}",
     "not only … but also … must match": "{not only … but also …|not only, but also,} must match",
     "One: 's     Many: s'": "One: {’s|apostrophe s.} {·|} Many: {s’|s apostrophe.}",
+    "past-to-now": "{past-to-now|past to now}",
     "Neither / nor": "{Neither / nor|Neither, nor}",
     "neither / nor": "{neither / nor|neither, nor}",
 }
@@ -238,7 +243,7 @@ def speak(d, prev, nxt):
     """How the voice should say one shown token."""
     s = d.replace("’", "'").replace("‘", "'").replace("“", '"').replace("”", '"')
     if re.fullmatch(r"_{2,}\W*", s):
-        return "blank" + s.strip("_")
+        return ", blank" + (s.strip("_") or ",")      # pause on both sides, or "blank its" sounds like "blankets"
     bare = s.strip("()")
     if bare == "→":
         p, n = prev.strip(), nxt.strip()
@@ -318,11 +323,7 @@ def tokens_of(text, markup=True):
             t["say"] = ","                               # "it / its / they" → "it, its, they"
         if t["say"] is None:
             if "lt" in t:
-                tail = t["d"]
-                letter = t["lt"]
-                if letter == "A" and not tail.startswith((".", "?", "!")):
-                    letter = "Ay"
-                t["say"] = letter + tail
+                t["say"] = (LETTER_A if t["lt"] == "A" else t["lt"]) + t["d"]
             else:
                 prev = toks[k - 1]["d"] if k else ""
                 nxt = toks[k + 1]["d"] if k + 1 < len(toks) else ""
@@ -341,6 +342,7 @@ class Line:
         s = re.sub(r"\s+", " ", s).strip()
         s = re.sub(r"\s+([,.;:!?])", r"\1", s)
         s = re.sub(r"\.\.+", ".", s)                    # "S.A.T." at the end of a sentence
+        s = re.sub(r",(\s*,)+", ",", s).lstrip(",;: ")   # ", blank," next to a comma already there
         if s and s[-1] not in ".?!":
             s = s.rstrip(":;,—– ") + "."
         return s
@@ -378,6 +380,11 @@ class Line:
 
 def norm(s):
     return re.sub(r"[^0-9a-z]", "", s.lower())
+
+
+def plain(s):
+    """Spoken text without pronunciation markup: "[A](/ˈA/)" → "A"."""
+    return re.sub(r"\[([^\]]*)\]\(/[^/]*/\)", r"\1", s)
 
 
 # =============================================================================================
@@ -698,35 +705,8 @@ def cue_text(c):
 # =============================================================================================
 # Speech
 # =============================================================================================
-async def synth(text, sem):
-    key = hashlib.sha1(f"{VOICE}|{RATE}|{text}".encode()).hexdigest()[:20]
-    mp3, meta = CACHE / f"{key}.mp3", CACHE / f"{key}.json"
-    if mp3.exists() and meta.exists():
-        return mp3, json.loads(meta.read_text(encoding="utf-8"))
-    async with sem:
-        last = None
-        for attempt in range(6):
-            try:
-                comm = edge_tts.Communicate(text, VOICE, rate=RATE, boundary="WordBoundary")
-                audio, words = bytearray(), []
-                async for ch in comm.stream():
-                    if ch["type"] == "audio":
-                        audio += ch["data"]
-                    elif ch["type"] == "WordBoundary":
-                        words.append([ch["offset"] / 1e7, ch["duration"] / 1e7, ch["text"]])
-                if not audio or not words:
-                    raise RuntimeError("empty response")
-                mp3.write_bytes(bytes(audio))
-                meta.write_text(json.dumps(words), encoding="utf-8")
-                return mp3, words
-            except Exception as e:      # network hiccups: back off and retry
-                last = e
-                await asyncio.sleep(2 + 3 * attempt)
-        raise RuntimeError(f"speech failed for {text!r}: {last}")
-
-
-def decode(mp3):
-    out = subprocess.run([FFMPEG, "-v", "error", "-i", str(mp3), "-f", "s16le", "-ac", "1", "-ar", str(SR), "-"],
+def decode(path):
+    out = subprocess.run([FFMPEG, "-v", "error", "-i", str(path), "-f", "s16le", "-ac", "1", "-ar", str(SR), "-"],
                          capture_output=True, check=True).stdout
     return np.frombuffer(out, dtype=np.int16).astype(np.float32) / 32768.0
 
@@ -735,7 +715,7 @@ def align(line, words):
     """Map the voice's word timings onto the line's tokens (by characters, so 1,991 or S.A.T. still match)."""
     exp, owner = [], []
     for k, t in enumerate(line.toks):
-        for ch in norm(t["say"]):
+        for ch in norm(plain(t["say"])):
             exp.append(ch)
             owner.append(k)
     got, gt = [], []
@@ -756,26 +736,30 @@ def align(line, words):
     return start, end, hits / max(1, len(exp))
 
 
-async def speak_all(videos):
+def speak_all(videos):
+    """Speak every line with Kokoro (one batch run for all lines not already cached)."""
     CACHE.mkdir(parents=True, exist_ok=True)
-    sem = asyncio.Semaphore(TTS_PARALLEL)
-    jobs = {}
-    for V in videos:
-        for sc in V.scenes:
-            for it in sc.items:
-                jobs.setdefault(it.line.say, None)
-    texts = list(jobs)
-    print(f"speech: {len(texts)} lines", flush=True)
-    results = await asyncio.gather(*(synth(t, sem) for t in texts))
-    return dict(zip(texts, results))
+    texts = list(dict.fromkeys(it.line.say for V in videos for sc in V.scenes for it in sc.items))
+    base = {t: CACHE / hashlib.sha1(f"kokoro|{VOICE}|{SPEED}|{CUTE}|{t}".encode()).hexdigest()[:20] for t in texts}
+    todo = [{"text": t, "out": str(b)} for t, b in base.items()
+            if not (b.with_suffix(".wav").exists() and b.with_suffix(".json").exists())]
+    print(f"speech: {len(texts)} lines, {len(todo)} to make", flush=True)
+    if todo:
+        job = {"voice": VOICE, "speed": SPEED, "cute": list(CUTE), "items": todo}
+        subprocess.run([str(TTS_PY), str(TOOLS / "kokoro_tts.py")], input=json.dumps(job), text=True, check=True)
+    speech = {}
+    for t, b in base.items():
+        words = json.loads(b.with_suffix(".json").read_text(encoding="utf-8"))
+        speech[t] = (b.with_suffix(".wav"), [[s, e - s, w] for s, e, w in words])
+    return speech
 
 
 def prepare_audio(V, speech):
     for sc in V.scenes:
         for it in sc.items:
             L = it.line
-            mp3, words = speech[L.say]
-            a = decode(mp3)
+            wav, words = speech[L.say]
+            a = decode(wav)
             loud = np.where(np.abs(a) > 10 ** (-40 / 20))[0]
             if len(loud):
                 s0, s1 = max(0, loud[0] - int(0.03 * SR)), min(len(a), loud[-1] + int(0.09 * SR))
@@ -1106,7 +1090,7 @@ async def main():
                     fh.write(f"  {it.line.say}\n" + (f"    [screen] {shown}\n" if norm(shown) != norm(it.line.say) else ""))
     print(f"script written to {script}", flush=True)
 
-    speech = await speak_all(videos)
+    speech = speak_all(videos)
     for V in videos:
         prepare_audio(V, speech)
     print(f"speech ready in {time.time() - t0:.0f}s", flush=True)
